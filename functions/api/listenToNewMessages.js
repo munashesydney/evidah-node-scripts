@@ -14,25 +14,34 @@ const db = getFirestore();
 const { BASE_URL, ENDPOINTS } = require('./constants');
 const { getCompanyName, getUserData, removeAfterAt } = require('./helpers/userHelpers');
 const { getConversationHistory } = require('./helpers/ticketHelpers');
+const { runActionTriggers } = require('./helpers/actionTriggerHelper');
 
 /**
  * Calls the employee respond API to get AI response
  * @param {string} uid - User UID
  * @param {string} companyId - Company ID
  * @param {Array} messages - Array of messages with role and content
+ * @param {Object} context - Optional context object with ticketId, sessionId, etc.
  * @returns {Promise<Object>} - Response from the API
  */
-async function getAIResponse(uid, companyId, messages) {
+async function getAIResponse(uid, companyId, messages, context = {}) {
   try {
     const url = `${BASE_URL}${ENDPOINTS.EMPLOYEE_RESPOND}`;
     
-    const response = await axios.post(url, {
+    const requestBody = {
       uid,
       companyId,
       employee: 'charlie',
       messages,
       temperature: 0.7,
-    }, {
+    };
+
+    // Add context if provided (includes ticketId, sessionId, etc.)
+    if (context && Object.keys(context).length > 0) {
+      requestBody.context = context;
+    }
+    
+    const response = await axios.post(url, requestBody, {
       headers: {
         'Content-Type': 'application/json',
       },
@@ -128,28 +137,6 @@ exports.listenToNewMessages = onDocumentCreated(
         return;
       }
 
-      // Feature flags: org-level and ticket-level
-      const aiMessagesOn = knowledgebaseData.aiMessagesOn || false;
-      const aiSuggestionsOn = knowledgebaseData.aiSuggestionsOn || false;
-
-      console.log('AI Messages On:', aiMessagesOn);
-      console.log('AI Suggestions On:', aiSuggestionsOn);
-
-      // If both are off, don't do anything
-      if (!aiMessagesOn && !aiSuggestionsOn) {
-        console.log('Both AI Auto Response and AI Suggestions are turned off');
-        return;
-      }
-
-      // Check ticket-level AI setting
-      if ('aiOn' in ticketData) {
-        console.log('aiOn exists');
-        if (!ticketData.aiOn) {
-          console.log('AI turned off for this ticket');
-          return;
-        }
-      }
-
       // Only respond to inbound messages from the customer
       const messageType = messageData.type || '';
       console.log('Processing message type:', messageType);
@@ -158,10 +145,34 @@ exports.listenToNewMessages = onDocumentCreated(
         return;
       }
 
-      // Get conversation history
-      const conversationHistory = await getConversationHistory(ticketId, uid, companyId);
+      // Create inbox notification for new message
+      try {
+        const notificationUrl = `${BASE_URL}/api/notifications/create`;
+        const inReplyTo = messageData.inReplyTo || '';
+        const isNewTicket = inReplyTo === 'N/A' || inReplyTo === '';
+        
+        await axios.post(notificationUrl, {
+          uid,
+          companyId,
+          type: 'inbox',
+          referenceId: ticketId,
+          title: isNewTicket ? 'New Ticket Received' : 'New Reply on Ticket',
+          message: `${ticketData.subject || 'No subject'}`,
+        }, {
+          headers: {
+            'Content-Type': 'application/json',
+          },
+          timeout: 10000,
+        });
+        
+        console.log('Inbox notification created for ticket:', ticketId);
+      } catch (notifError) {
+        console.error('Failed to create inbox notification:', notifError.message);
+        // Don't fail the entire function if notification creation fails
+      }
 
-      // Ensure the latest inbound message is included
+      // Build conversation history and trigger data for actions
+      const conversationHistory = await getConversationHistory(ticketId, uid, companyId);
       if (messageData.body) {
         conversationHistory.push({
           role: 'user',
@@ -169,12 +180,75 @@ exports.listenToNewMessages = onDocumentCreated(
         });
       }
 
-      console.log(`Processing ${conversationHistory.length} messages for AI response`);
+      const triggerData = {
+        ticketId,
+        ticketSubject: ticketData.subject || '',
+        ticketFrom: ticketData.from || '',
+        messageBody: messageData.body || '',
+        messageType: messageData.type || '',
+      };
+
+      // TRIGGER ACTIONS - Independent of AI settings
+      const inReplyTo = messageData.inReplyTo || '';
+      if (inReplyTo !== 'N/A' && inReplyTo !== '') {
+        console.log('Message is a reply - checking for ticket_reply actions');
+        await runActionTriggers({
+          uid,
+          companyId,
+          triggerType: 'ticket_reply',
+          triggerData,
+          conversationHistory,
+        });
+      } else {
+        console.log('Message is a new ticket - checking for new_ticket actions');
+        await runActionTriggers({
+          uid,
+          companyId,
+          triggerType: 'new_ticket',
+          triggerData,
+          conversationHistory,
+        });
+      }
+
+      // LEGACY AI AUTO RESPONSE/SUGGESTIONS - Check feature flags
+      const aiMessagesOn = knowledgebaseData.aiMessagesOn || false;
+      const aiSuggestionsOn = knowledgebaseData.aiSuggestionsOn || false;
+
+      console.log('AI Messages On:', aiMessagesOn);
+      console.log('AI Suggestions On:', aiSuggestionsOn);
+
+      // If both are off, skip legacy AI processing
+      if (!aiMessagesOn && !aiSuggestionsOn) {
+        console.log('Both AI Auto Response and AI Suggestions are turned off - skipping legacy AI processing');
+        return;
+      }
+
+      // Check ticket-level AI setting
+      if ('aiOn' in ticketData) {
+        console.log('aiOn exists');
+        if (!ticketData.aiOn) {
+          console.log('AI turned off for this ticket - skipping legacy AI processing');
+          return;
+        }
+      }
+
+      console.log(`Processing ${conversationHistory.length} messages for legacy AI response`);
+
+      // Get customer info from ticket data
+      const customerEmail = ticketData.from || '';
+      const customerName = removeAfterAt(customerEmail); // Extract name from email if available
+      
+      // Build context with ticket_id and customer info
+      const context = {
+        ticketId: ticketId,
+        customerEmail: customerEmail,
+        customerName: customerName,
+      };
 
       // Get AI response from the employee respond API
       let aiResponse;
       try {
-        const responseData = await getAIResponse(uid, companyId, conversationHistory);
+        const responseData = await getAIResponse(uid, companyId, conversationHistory, context);
         aiResponse = responseData.content || responseData.response || responseData.message;
         
         if (!aiResponse) {

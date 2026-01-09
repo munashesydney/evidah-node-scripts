@@ -9,7 +9,7 @@ const { getFirestore } = require('firebase-admin/firestore');
 const db = getFirestore();
 
 // Import helper functions
-const { extractTopLevelMessage, removeEmailQuotes } = require('./helpers/emailHelpers');
+const { extractTopLevelMessage, removeEmailQuotes, offloadInlineImages } = require('./helpers/emailHelpers');
 const { getUidWithTo, getCompanyName, getSubdomain } = require('./helpers/userHelpers');
 const { addMessageToInReplyToTicket } = require('./helpers/ticketHelpers');
 const { getNewTicketConfirmationHTML } = require('./helpers/emailTemplates');
@@ -29,13 +29,17 @@ const { sendNewTicketConfirmation } = require('./helpers/emailService');
  * @param {string} html - The HTML content
  * @param {Array} downloadURLs - Array of attachment download URLs
  * @param {string} selectedCompany - The selected company (default: 'default')
+ * @param {boolean} isSpam - Whether the email is from spam folder (default: false)
  * @returns {Promise<Object>} - Status object with success/failure information
  */
-async function makeContact2(from, to, subject, date, body, messageId, inReplyTo, references, uid, html, downloadURLs, selectedCompany = 'default') {
+async function makeContact2(from, to, subject, date, body, messageId, inReplyTo, references, uid, html, downloadURLs, selectedCompany = 'default', isSpam = false) {
 
   //lets get the uid
-  uid = await getUidWithTo(to, selectedCompany);
-  console.log('Directed User uid:', uid);
+  if(uid == "" || uid == null || uid == 'N/A'){
+      uid = await getUidWithTo(to, selectedCompany);
+      console.log('Directed User uid:', uid);
+  }
+
 
   if (uid == null) {
     return { "status": 0, "message": "Uid not found" };
@@ -52,6 +56,12 @@ async function makeContact2(from, to, subject, date, body, messageId, inReplyTo,
     html = await removeEmailQuotes(html);
   }
 
+  const { html: sanitizedHtml, attachments: inlineAttachments } = await offloadInlineImages(html, uid);
+  html = sanitizedHtml;
+
+  const normalizedDownloadURLs = Array.isArray(downloadURLs) ? downloadURLs : [];
+  const mergedAttachments = [...normalizedDownloadURLs, ...inlineAttachments];
+
   console.log("date before");
   console.log(date);
 
@@ -64,7 +74,7 @@ async function makeContact2(from, to, subject, date, body, messageId, inReplyTo,
   console.log("Date after ");
   console.log(date);
 
-  const messageData = { from: from, to: to, subject: subject, date: date, body: body, messageId: messageId, inReplyTo: inReplyTo, references: references, html: html, uid: uid, type: "humanReceiver", attachments: downloadURLs };
+  const messageData = { from: from, to: to, subject: subject, date: date, body: body, messageId: messageId, inReplyTo: inReplyTo, references: references, html: html, uid: uid, type: "humanReceiver", attachments: mergedAttachments, isSpam: isSpam };
 
   //set the contact
   const ticketsCollection = db.collection('Users').doc(uid).collection('knowledgebases').doc(selectedCompany).collection('Helpdesk').doc('default').collection('tickets');
@@ -90,6 +100,7 @@ async function makeContact2(from, to, subject, date, body, messageId, inReplyTo,
       status: "Open",
       read: false,
       ticketNumber: ticketNumber, // Set the ticket number here
+      isSpam: isSpam, // Flag if this ticket is from spam folder
     });
 
     console.log('Ticket Created');
@@ -127,7 +138,7 @@ async function makeContact2(from, to, subject, date, body, messageId, inReplyTo,
  */
 exports.makeContact = onRequest({ cors: true, invoker: 'public' }, async (req, res) => {
   try {
-    const { from, to, subject, date, body, messageId, inReplyTo, references, uid, html, downloadURLs, selectedCompany = 'default' } = req.body;
+    const { from, to, subject, date, body, messageId, inReplyTo, references, uid, html, downloadURLs, selectedCompany = 'default', isSpam = false } = req.body;
 
     var actualDate = date;
     if (date == "current") {
@@ -141,7 +152,7 @@ exports.makeContact = onRequest({ cors: true, invoker: 'public' }, async (req, r
       }
     }
 
-    const result = await makeContact2(from, to, subject, actualDate, body, messageId, inReplyTo, references, uid, html, downloadURLs, selectedCompany);
+    const result = await makeContact2(from, to, subject, actualDate, body, messageId, inReplyTo, references, uid, html, downloadURLs, selectedCompany, isSpam);
     res.status(200).send(result);
   } catch (error) {
     console.error('makeContact error:', error);
@@ -150,6 +161,7 @@ exports.makeContact = onRequest({ cors: true, invoker: 'public' }, async (req, r
 });
 
 module.exports = {
+  makeContact: exports.makeContact,
   makeContact2
 };
 

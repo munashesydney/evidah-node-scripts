@@ -2,6 +2,11 @@
  * Email helper functions for processing email content
  */
 
+const { getStorage } = require('firebase-admin/storage');
+const { v4: uuidv4 } = require('uuid');
+
+const storage = getStorage();
+
 /**
  * Extracts the top-level message from an email string by removing quoted replies
  * @param {string} emailString - The email content to process
@@ -72,9 +77,66 @@ async function extractEmailName(email) {
   return null;
 }
 
+/**
+ * Finds inline base64 images inside HTML, uploads them to Cloud Storage, and replaces the data URI with a URL.
+ * @param {string} html - Raw HTML content that may contain inline base64 images.
+ * @param {string} uid - UID used to organize stored attachments (optional).
+ * @returns {Promise<{html: string, attachments: Array}>} Sanitized HTML and metadata for stored attachments.
+ */
+async function offloadInlineImages(html, uid = 'unknown') {
+  if (!html || typeof html !== 'string') {
+    return { html, attachments: [] };
+  }
+
+  const bucket = storage.bucket();
+  const dataUriRegex = /data:(image\/[a-zA-Z0-9.+-]+);base64,([A-Za-z0-9+/=]+)/gi;
+  const attachments = [];
+  let cleanedHtml = html;
+
+  const matches = Array.from(html.matchAll(dataUriRegex));
+
+  for (const match of matches) {
+    const mimeType = match[1];
+    const base64Payload = match[2];
+
+    try {
+      const buffer = Buffer.from(base64Payload, 'base64');
+      const filePath = `inline-attachments/${uid || 'unknown'}/${Date.now()}-${uuidv4()}`;
+      const file = bucket.file(filePath);
+
+      await file.save(buffer, {
+        resumable: false,
+        metadata: {
+          contentType: mimeType,
+          cacheControl: 'public,max-age=31536000'
+        }
+      });
+
+      const [url] = await file.getSignedUrl({
+        action: 'read',
+        expires: '2099-01-01'
+      });
+
+      cleanedHtml = cleanedHtml.replace(match[0], url);
+      attachments.push({
+        type: 'inlineImage',
+        mimeType,
+        url,
+        size: buffer.length,
+        storagePath: filePath
+      });
+    } catch (error) {
+      console.error('Error offloading inline image:', error);
+    }
+  }
+
+  return { html: cleanedHtml, attachments };
+}
+
 module.exports = {
   extractTopLevelMessage,
   removeEmailQuotes,
-  extractEmailName
+  extractEmailName,
+  offloadInlineImages
 };
 

@@ -45,6 +45,9 @@ exports.makeContact = makeContactApi.makeContact;
 const listenToNewMessagesApi = require('./api/listenToNewMessages');
 exports.listenToNewMessages = listenToNewMessagesApi.listenToNewMessages;
 
+const listenToAnsweredQuestionsApi = require('./api/listenToAnsweredQuestions');
+exports.listenToAnsweredQuestions = listenToAnsweredQuestionsApi.listenToAnsweredQuestions;
+
 const onUserCreateApi = require('./api/onUserCreate');
 exports.onUserCreate = onUserCreateApi.onUserCreate;
 
